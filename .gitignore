@@ -218,3 +218,30 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ==========================================
+# Snowflake ETL Pipeline - Project Settings
+# ==========================================
+
+# Environment variables and credentials
+.env.*
+!.env.example
+
+# Airflow
+airflow/logs/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+
+# Local dataset files (temporary outputs)
+assets/datasets/Transformed_full/*
+assets/datasets/Transformed_tables/*
+
+!assets/datasets/Transformed_full/.gitkeep
+!assets/datasets/Transformed_tables/.gitkeep
