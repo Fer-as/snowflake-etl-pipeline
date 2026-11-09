@@ -1,4 +1,31 @@
 
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.3.0
+  environment:
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-api-server:8080/execution/"
+    
+    
+    
+  volumes:
+    -  ./airflow/dags:/opt/airflow/dags
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./airflow/logs:/opt/airflow/logs
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+
 services:
     postgres:
       image: postgres:16
@@ -15,6 +42,54 @@ services:
         timeout: 5s
         retries: 5
 
+ 
+
+    airflow-dag-processor:
+      <<: *airflow-common
+      command: dag-processor
+      depends_on:
+        <<: *airflow-common-depends-on
+        airflow-init:
+          condition: service_completed_successfully
+
+    airflow-scheduler:
+      <<: *airflow-common
+      command: scheduler
+      depends_on:
+        <<: *airflow-common-depends-on
+        airflow-init:
+          condition: service_completed_successfully
+
+    airflow-api-server:
+      <<: *airflow-common
+      command: api-server
+      ports:
+        - "8080:8080"
+      depends_on:
+        <<: *airflow-common-depends-on
+        airflow-init:
+          condition: service_completed_successfully
+
+    airflow-worker:
+      <<: *airflow-common
+      command: celery worker
+      depends_on:
+        <<: *airflow-common-depends-on
+        airflow-init:
+          condition: service_completed_successfully
+
+    airflow-triggerer:
+      <<: *airflow-common
+      command: triggerer
+      depends_on:
+        <<: *airflow-common-depends-on
+        airflow-init:
+          condition: service_completed_successfully
+
+    airflow-init:
+      <<: *airflow-common
+      command: db migrate
+      restart: "no"
     redis:
       image: redis:7-alpine
       healthcheck:
@@ -22,6 +97,8 @@ services:
         interval: 10s
         timeout: 5s
         retries: 5
+
+
 
 volumes:
   postgres_data:
