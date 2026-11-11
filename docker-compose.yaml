@@ -1,24 +1,66 @@
 
+# ============================================================
+# SNOWFLAKE ETL PIPELINE - DOCKER COMPOSE
+#
+# Services:
+#   - PostgreSQL: stores Airflow metadata
+#   - Redis: queues tasks for Celery workers
+#   - Airflow API server: provides the web interface
+#   - Airflow scheduler: schedules DAG runs
+#   - Airflow DAG processor: discovers and parses DAG files
+#   - Airflow worker: executes ETL tasks
+#   - Airflow triggerer: handles deferred tasks
+#   - Airflow init: prepares the metadata database
+# ============================================================
+
+
+# Shared configuration for all Airflow services.
+# The YAML anchor (&airflow-common) avoids repeating settings.
 x-airflow-common: &airflow-common
-  image: apache/airflow:3.3.0
+
+  # Build our custom Airflow image.
+  # The Dockerfile installs boto3 and AWS CRT for AWS login.
+  build:
+    context: ./docker
+
+  image: retail-etl-airflow:3.3.0
+
   environment:
+    # Use CeleryExecutor to execute tasks in worker containers.
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+
+    # PostgreSQL stores DAG runs, task states and metadata.
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+
+    # Celery stores task results in PostgreSQL.
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+
+    # Encryption key and API authentication settings.
+    # Values come from the local .env file.
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
-    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
     AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+
+    # New DAGs start paused, so we can test them manually.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    # Redis acts as the message broker for CeleryExecutor.
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+
+    # Workers communicate with the Airflow execution API.
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-api-server:8080/execution/"
-    
-    
-    
+
+  # Shared folders available inside Airflow containers.
+  # Our Python scripts use paths relative to /opt/airflow.
   volumes:
-    -  ./airflow/dags:/opt/airflow/dags
+    - ./airflow/dags:/opt/airflow/dags
     - ./airflow/plugins:/opt/airflow/plugins
     - ./airflow/logs:/opt/airflow/logs
+    - ./python_scripts:/opt/airflow/python_scripts
+    - ./assets/datasets:/opt/airflow/assets/datasets
+
+  # Airflow services must wait for PostgreSQL and Redis.
   depends_on: &airflow-common-depends-on
     postgres:
       condition: service_healthy
@@ -26,79 +68,147 @@ x-airflow-common: &airflow-common
       condition: service_healthy
 
 
+# ============================================================
+# SERVICES
+# ============================================================
+
 services:
-    postgres:
-      image: postgres:16
-      volumes:
-        - postgres_data:/var/lib/postgresql/data
-      environment:
-        POSTGRES_USER: ${POSTGRES_USER}
-        POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-        POSTGRES_DB: ${POSTGRES_DB}
 
-      healthcheck:
-        test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
-        interval: 10s
-        timeout: 5s
-        retries: 5
+  # ----------------------------------------------------------
+  # PostgreSQL - Airflow metadata database
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:16
 
- 
+    volumes:
+      # Named volume keeps database data between restarts.
+      - postgres_data:/var/lib/postgresql/data
 
-    airflow-dag-processor:
-      <<: *airflow-common
-      command: dag-processor
-      depends_on:
-        <<: *airflow-common-depends-on
-        airflow-init:
-          condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
 
-    airflow-scheduler:
-      <<: *airflow-common
-      command: scheduler
-      depends_on:
-        <<: *airflow-common-depends-on
-        airflow-init:
-          condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-    airflow-api-server:
-      <<: *airflow-common
-      command: api-server
-      ports:
-        - "8080:8080"
-      depends_on:
-        <<: *airflow-common-depends-on
-        airflow-init:
-          condition: service_completed_successfully
+  # ----------------------------------------------------------
+  # Redis - Message broker for CeleryExecutor
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
 
-    airflow-worker:
-      <<: *airflow-common
-      command: celery worker
-      depends_on:
-        <<: *airflow-common-depends-on
-        airflow-init:
-          condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-    airflow-triggerer:
-      <<: *airflow-common
-      command: triggerer
-      depends_on:
-        <<: *airflow-common-depends-on
-        airflow-init:
-          condition: service_completed_successfully
+  # ----------------------------------------------------------
+  # Airflow initialization
+  # Runs database migrations before other Airflow services.
+  # Exits successfully when initialization is complete.
+  # ----------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    command: db migrate
+    restart: "no"
 
-    airflow-init:
-      <<: *airflow-common
-      command: db migrate
-      restart: "no"
-    redis:
-      image: redis:7-alpine
-      healthcheck:
-        test: ["CMD", "redis-cli", "ping"]
-        interval: 10s
-        timeout: 5s
-        retries: 5
+  # ----------------------------------------------------------
+  # DAG processor
+  # Discovers and parses airflow/dags/retail_etl_dag.py.
+  # ----------------------------------------------------------
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ----------------------------------------------------------
+  # Scheduler
+  # Determines when DAG tasks should run.
+  # ----------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ----------------------------------------------------------
+  # API server
+  # Makes the Airflow UI available at localhost:8080.
+  # ----------------------------------------------------------
+  airflow-api-server:
+    <<: *airflow-common
+    command: api-server
+
+    ports:
+      - "8080:8080"
+
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ----------------------------------------------------------
+  # Worker
+  # Executes the Python transformation and S3 upload tasks.
+  # ----------------------------------------------------------
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+
+    # Service-specific volumes override the shared list.
+    # Therefore we repeat all five ETL mounts here.
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/logs:/opt/airflow/logs
+      - ./python_scripts:/opt/airflow/python_scripts
+      - ./assets/datasets:/opt/airflow/assets/datasets
+
+      # Mount the existing Windows AWS CLI configuration.
+      # Read-only prevents the container changing the config.
+      - "${USERPROFILE}/.aws/config:/home/airflow/.aws/config:ro"
+
+      # Mount the local AWS login session cache.
+      # Boto3 and AWS CRT use it for temporary credentials.
+      # The cache is writable for session refresh.
+      # This mount is for trusted local development only.
+      - "${USERPROFILE}/.aws/login/cache:/home/airflow/.aws/login/cache"
+
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ----------------------------------------------------------
+  # Triggerer
+  # Manages asynchronous and deferred Airflow tasks.
+  # ----------------------------------------------------------
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
 
 
+# ============================================================
+# PERSISTENT STORAGE
+# ============================================================
 
 volumes:
+  # Preserve Airflow's PostgreSQL metadata between restarts.
   postgres_data:
