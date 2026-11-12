@@ -12,30 +12,30 @@ from airflow.providers.common.sql.operators.sql import (
 
 
 # ============================================================
-# RETAIL ETL PIPELINE
+# SNOWFLAKE RETAIL ETL PIPELINE
 #
-# 1. Transform the original retail dataset
-# 2. Split the data into customers, products and orders
-# 3. Upload the three CSV files to Amazon S3
-# 4. Verify the Airflow-to-Snowflake connection
-# 5. Load customers into a Snowflake staging table
-# 6. Load products into a Snowflake staging table
-# 7. Load orders into a Snowflake staging table
-# 8. Validate staging data quality
-# 9. Publish validated data to the final Snowflake tables
-# 10. Validate the published data
+#  1. Transform the original retail dataset
+#  2. Split data into customers, products and orders
+#  3. Upload the three CSV files to Amazon S3
+#  4. Verify the Airflow-to-Snowflake connection
+#  5. Load customers into a Snowflake staging table
+#  6. Load products into a Snowflake staging table
+#  7. Load orders into a Snowflake staging table
+#  8. Validate staging data quality
+#  9. Publish validated data to the final tables
+# 10. Validate published row counts and primary keys
+# 11. Verify final tables match staging in both directions
 #
 # Loading strategy: Full refresh
 # Schedule: Manual during development
 #
-# The staging validation must pass before publishing.
-# INSERT OVERWRITE prevents duplicate rows on repeated runs.
+# Data is validated before and after publishing.
 # ============================================================
 
 
 with DAG(
     dag_id="retail_etl_pipeline",
-    description="Transform retail data, load Snowflake and validate results",
+    description="End-to-end retail ETL with Snowflake validation",
     start_date=pendulum.datetime(2026, 11, 1, tz="UTC"),
     schedule=None,
     catchup=False,
@@ -52,6 +52,8 @@ with DAG(
     #
     # Read the original CSV, standardize columns, convert
     # data types and generate data-quality flags.
+    #
+    # The working directory makes relative file paths work.
     # --------------------------------------------------------
     transform_data = BashOperator(
         task_id="transform_data",
@@ -65,7 +67,10 @@ with DAG(
     # --------------------------------------------------------
     # TASK 2: SPLIT DATA INTO TABLES
     #
-    # Generate customers.csv, products.csv and orders.csv.
+    # Generate:
+    # - customers.csv
+    # - products.csv
+    # - orders.csv
     # --------------------------------------------------------
     split_into_tables = BashOperator(
         task_id="split_into_tables",
@@ -79,8 +84,8 @@ with DAG(
     # --------------------------------------------------------
     # TASK 3: UPLOAD TO AMAZON S3
     #
-    # Upload the three CSV files to the retail/ S3 prefix.
-    # Credentials are supplied through the worker environment.
+    # Upload the CSV files to the retail/ S3 prefix.
+    # AWS authentication comes from the worker environment.
     # --------------------------------------------------------
     upload_to_s3 = BashOperator(
         task_id="upload_to_s3",
@@ -92,9 +97,10 @@ with DAG(
     )
 
     # --------------------------------------------------------
-    # TASK 4: VERIFY SNOWFLAKE
+    # TASK 4: VERIFY SNOWFLAKE CONNECTION
     #
-    # Confirm that Airflow can execute SQL in Snowflake.
+    # Confirm that Airflow can execute a read-only query
+    # through the snowflake_default connection.
     # --------------------------------------------------------
     verify_snowflake = SQLExecuteQueryOperator(
         task_id="verify_snowflake",
@@ -111,8 +117,10 @@ with DAG(
     # --------------------------------------------------------
     # TASK 5: STAGE CUSTOMERS
     #
-    # Recreate an empty staging table matching CUSTOMERS.
-    # Load customers.csv without changing the final table.
+    # Recreate a transient table matching CUSTOMERS.
+    # Load customers.csv from the external S3 stage.
+    #
+    # The final CUSTOMERS table is not modified here.
     # --------------------------------------------------------
     stage_customers = SQLExecuteQueryOperator(
         task_id="stage_customers",
@@ -142,8 +150,10 @@ with DAG(
     # --------------------------------------------------------
     # TASK 6: STAGE PRODUCTS
     #
-    # Recreate an empty staging table matching PRODUCTS.
-    # Load products.csv without changing the final table.
+    # Recreate a transient table matching PRODUCTS.
+    # Load products.csv from the external S3 stage.
+    #
+    # The final PRODUCTS table is not modified here.
     # --------------------------------------------------------
     stage_products = SQLExecuteQueryOperator(
         task_id="stage_products",
@@ -173,8 +183,10 @@ with DAG(
     # --------------------------------------------------------
     # TASK 7: STAGE ORDERS
     #
-    # Recreate an empty staging table matching ORDERS.
-    # Load orders.csv without changing the final table.
+    # Recreate a transient table matching ORDERS.
+    # Load orders.csv from the external S3 stage.
+    #
+    # The final ORDERS table is not modified here.
     # --------------------------------------------------------
     stage_orders = SQLExecuteQueryOperator(
         task_id="stage_orders",
@@ -204,8 +216,14 @@ with DAG(
     # --------------------------------------------------------
     # TASK 8: VALIDATE STAGING DATA
     #
-    # Verify expected row counts and unique, non-null keys.
-    # A failed check prevents the publishing task from running.
+    # Verify:
+    # - Expected row counts
+    # - Unique identifiers
+    # - Non-null identifiers
+    #
+    # If any check fails, publishing will not run.
+    #
+    # Counts are fixed for the current retail dataset.
     # --------------------------------------------------------
     validate_staging = SQLCheckOperator(
         task_id="validate_staging",
@@ -241,14 +259,11 @@ with DAG(
     # --------------------------------------------------------
     # TASK 9: PUBLISH VALIDATED DATA
     #
-    # Replace the rows in all three final tables.
+    # Use INSERT OVERWRITE to replace final-table rows
+    # instead of appending potentially duplicate records.
     #
-    # INSERT OVERWRITE preserves the existing table objects,
-    # schemas and grants.
-    #
-    # BEGIN/COMMIT group the three changes in one transaction.
-    # If an operation fails before COMMIT, the transaction
-    # should be rolled back rather than partially published.
+    # The three updates are grouped in one transaction.
+    # No DDL statements are used within this transaction.
     # --------------------------------------------------------
     publish_to_snowflake = SQLExecuteQueryOperator(
         task_id="publish_to_snowflake",
@@ -314,10 +329,12 @@ with DAG(
     # --------------------------------------------------------
     # TASK 10: VALIDATE PUBLISHED DATA
     #
-    # Verify that the final tables contain the expected
-    # rows with unique, non-null primary identifiers.
+    # Verify the final tables have:
+    # - Expected row counts
+    # - Unique identifiers
+    # - Non-null identifiers
     #
-    # This catches publishing errors after the transaction.
+    # This validates the published dataset's basic quality.
     # --------------------------------------------------------
     validate_published_data = SQLCheckOperator(
         task_id="validate_published_data",
@@ -351,10 +368,90 @@ with DAG(
     )
 
     # --------------------------------------------------------
+    # TASK 11: VALIDATE FINAL TABLE CONSISTENCY
+    #
+    # Compare each final table with its staging table in
+    # both directions using EXCEPT.
+    #
+    # Final-only:
+    # Records in final that do not exist in staging.
+    #
+    # Staging-only:
+    # Records in staging that do not exist in final.
+    #
+    # NOT EXISTS returns TRUE when no differences exist.
+    #
+    # SQLCheckOperator fails if any of the six checks is
+    # FALSE, making data consistency part of every DAG run.
+    # --------------------------------------------------------
+    validate_final_consistency = SQLCheckOperator(
+        task_id="validate_final_consistency",
+        conn_id="snowflake_default",
+        sql="""
+            SELECT
+                -- CUSTOMERS: final minus staging
+                NOT EXISTS (
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.CUSTOMERS
+                    EXCEPT
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.CUSTOMERS_STAGING
+                ) AS CUSTOMERS_FINAL_MATCH,
+
+                -- CUSTOMERS: staging minus final
+                NOT EXISTS (
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.CUSTOMERS_STAGING
+                    EXCEPT
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.CUSTOMERS
+                ) AS CUSTOMERS_STAGING_MATCH,
+
+                -- PRODUCTS: final minus staging
+                NOT EXISTS (
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.PRODUCTS
+                    EXCEPT
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.PRODUCTS_STAGING
+                ) AS PRODUCTS_FINAL_MATCH,
+
+                -- PRODUCTS: staging minus final
+                NOT EXISTS (
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.PRODUCTS_STAGING
+                    EXCEPT
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.PRODUCTS
+                ) AS PRODUCTS_STAGING_MATCH,
+
+                -- ORDERS: final minus staging
+                NOT EXISTS (
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.ORDERS
+                    EXCEPT
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.ORDERS_STAGING
+                ) AS ORDERS_FINAL_MATCH,
+
+                -- ORDERS: staging minus final
+                NOT EXISTS (
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.ORDERS_STAGING
+                    EXCEPT
+                    SELECT *
+                    FROM RETAIL_ETL_DB.RETAIL.ORDERS
+                ) AS ORDERS_STAGING_MATCH
+        """,
+    )
+
+    # --------------------------------------------------------
     # TASK DEPENDENCIES
     #
-    # Tasks execute in order. Publishing happens only after
-    # all three staging tables pass validation.
+    # Each task starts only after its predecessor succeeds.
+    #
+    # The final consistency check runs after publishing
+    # and after the published data-quality validation.
     # --------------------------------------------------------
     (
         transform_data
@@ -367,4 +464,5 @@ with DAG(
         >> validate_staging
         >> publish_to_snowflake
         >> validate_published_data
+        >> validate_final_consistency
     )
