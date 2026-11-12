@@ -2,9 +2,13 @@
 from datetime import timedelta
 
 import pendulum
+
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.bash import BashOperator
-from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
+from airflow.providers.common.sql.operators.sql import (
+    SQLExecuteQueryOperator,
+    SQLCheckOperator,
+)
 
 
 # ============================================================
@@ -17,13 +21,16 @@ from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 # 5. Load customers into a Snowflake staging table
 # 6. Load products into a Snowflake staging table
 # 7. Load orders into a Snowflake staging table
+# 8. Validate row counts, unique keys and non-null keys
 #
-# Runs manually during development and testing.
+# The DAG runs manually during development and testing.
+# Final Snowflake tables are not modified by this version.
 # ============================================================
+
 
 with DAG(
     dag_id="retail_etl_pipeline",
-    description="Transform retail data, upload to S3, and stage data in Snowflake",
+    description="Transform retail data, upload to S3, stage and validate in Snowflake",
     start_date=pendulum.datetime(2026, 11, 1, tz="UTC"),
     schedule=None,
     catchup=False,
@@ -38,8 +45,10 @@ with DAG(
     # --------------------------------------------------------
     # TASK 1: TRANSFORM DATA
     #
-    # Read the original retail CSV, standardize columns,
-    # convert data types, and generate data-quality flags.
+    # Read the original retail CSV, standardize column names,
+    # convert data types and generate data-quality flags.
+    #
+    # cwd ensures relative dataset paths work inside Docker.
     # --------------------------------------------------------
     transform_data = BashOperator(
         task_id="transform_data",
@@ -54,7 +63,9 @@ with DAG(
     # TASK 2: SPLIT DATA INTO TABLES
     #
     # Create three CSV files:
-    # customers.csv, products.csv and orders.csv.
+    # - customers.csv
+    # - products.csv
+    # - orders.csv
     # --------------------------------------------------------
     split_into_tables = BashOperator(
         task_id="split_into_tables",
@@ -68,8 +79,10 @@ with DAG(
     # --------------------------------------------------------
     # TASK 3: UPLOAD FILES TO AMAZON S3
     #
-    # Upload the three CSV files to the retail/ folder
-    # in the configured S3 bucket.
+    # Upload all three CSV files to the retail/ prefix
+    # in the project's S3 bucket.
+    #
+    # Boto3 uses the AWS credentials available to the worker.
     # --------------------------------------------------------
     upload_to_s3 = BashOperator(
         task_id="upload_to_s3",
@@ -83,8 +96,8 @@ with DAG(
     # --------------------------------------------------------
     # TASK 4: VERIFY SNOWFLAKE CONNECTION
     #
-    # Run a read-only SQL query to confirm that Airflow
-    # can connect using the snowflake_default connection.
+    # Execute a read-only SQL query to confirm that Airflow
+    # can connect to Snowflake using snowflake_default.
     # --------------------------------------------------------
     verify_snowflake = SQLExecuteQueryOperator(
         task_id="verify_snowflake",
@@ -94,7 +107,7 @@ with DAG(
                 CURRENT_DATABASE(),
                 CURRENT_SCHEMA(),
                 CURRENT_ROLE(),
-                CURRENT_WAREHOUSE();
+                CURRENT_WAREHOUSE()
         """,
     )
 
@@ -103,7 +116,8 @@ with DAG(
     #
     # Recreate a transient staging table matching CUSTOMERS.
     # Load customers.csv from the external S3 stage.
-    # The final CUSTOMERS table is not modified.
+    #
+    # The final CUSTOMERS table remains unchanged.
     # --------------------------------------------------------
     stage_customers = SQLExecuteQueryOperator(
         task_id="stage_customers",
@@ -135,7 +149,8 @@ with DAG(
     #
     # Recreate a transient staging table matching PRODUCTS.
     # Load products.csv from the external S3 stage.
-    # The final PRODUCTS table is not modified.
+    #
+    # The final PRODUCTS table remains unchanged.
     # --------------------------------------------------------
     stage_products = SQLExecuteQueryOperator(
         task_id="stage_products",
@@ -167,7 +182,8 @@ with DAG(
     #
     # Recreate a transient staging table matching ORDERS.
     # Load orders.csv from the external S3 stage.
-    # The final ORDERS table is not modified.
+    #
+    # The final ORDERS table remains unchanged.
     # --------------------------------------------------------
     stage_orders = SQLExecuteQueryOperator(
         task_id="stage_orders",
@@ -195,9 +211,56 @@ with DAG(
     )
 
     # --------------------------------------------------------
+    # TASK 8: VALIDATE STAGING DATA
+    #
+    # Check all three staging tables for:
+    # - Expected row counts
+    # - Unique primary identifiers
+    # - No missing primary identifiers
+    #
+    # SQLCheckOperator fails if any returned value is false.
+    #
+    # Expected counts are fixed for the current source CSV.
+    # We will make these checks dynamic for incremental loads.
+    # --------------------------------------------------------
+    validate_staging = SQLCheckOperator(
+        task_id="validate_staging",
+        conn_id="snowflake_default",
+        sql="""
+            SELECT
+                (
+                    SELECT
+                        COUNT(*) = 4372
+                        AND COUNT(*) = COUNT(DISTINCT CUSTOMER_ID)
+                        AND COUNT(*) = COUNT(CUSTOMER_ID)
+                    FROM RETAIL_ETL_DB.RETAIL.CUSTOMERS_STAGING
+                ) AS CUSTOMERS_VALID,
+
+                (
+                    SELECT
+                        COUNT(*) = 4070
+                        AND COUNT(*) = COUNT(DISTINCT STOCK_CODE)
+                        AND COUNT(*) = COUNT(STOCK_CODE)
+                    FROM RETAIL_ETL_DB.RETAIL.PRODUCTS_STAGING
+                ) AS PRODUCTS_VALID,
+
+                (
+                    SELECT
+                        COUNT(*) = 541909
+                        AND COUNT(*) = COUNT(DISTINCT ORDER_LINE_ID)
+                        AND COUNT(*) = COUNT(ORDER_LINE_ID)
+                    FROM RETAIL_ETL_DB.RETAIL.ORDERS_STAGING
+                ) AS ORDERS_VALID
+        """,
+    )
+
+    # --------------------------------------------------------
     # TASK DEPENDENCIES
     #
-    # Execute each task only after its predecessor succeeds.
+    # Each task executes only after the previous task
+    # completes successfully.
+    #
+    # A failed validation stops the DAG before publishing.
     # --------------------------------------------------------
     (
         transform_data
@@ -207,4 +270,5 @@ with DAG(
         >> stage_customers
         >> stage_products
         >> stage_orders
+        >> validate_staging
     )
