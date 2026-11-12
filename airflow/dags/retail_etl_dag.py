@@ -21,16 +21,21 @@ from airflow.providers.common.sql.operators.sql import (
 # 5. Load customers into a Snowflake staging table
 # 6. Load products into a Snowflake staging table
 # 7. Load orders into a Snowflake staging table
-# 8. Validate row counts, unique keys and non-null keys
+# 8. Validate staging data quality
+# 9. Publish validated data to the final Snowflake tables
+# 10. Validate the published data
 #
-# The DAG runs manually during development and testing.
-# Final Snowflake tables are not modified by this version.
+# Loading strategy: Full refresh
+# Schedule: Manual during development
+#
+# The staging validation must pass before publishing.
+# INSERT OVERWRITE prevents duplicate rows on repeated runs.
 # ============================================================
 
 
 with DAG(
     dag_id="retail_etl_pipeline",
-    description="Transform retail data, upload to S3, stage and validate in Snowflake",
+    description="Transform retail data, load Snowflake and validate results",
     start_date=pendulum.datetime(2026, 11, 1, tz="UTC"),
     schedule=None,
     catchup=False,
@@ -45,10 +50,8 @@ with DAG(
     # --------------------------------------------------------
     # TASK 1: TRANSFORM DATA
     #
-    # Read the original retail CSV, standardize column names,
-    # convert data types and generate data-quality flags.
-    #
-    # cwd ensures relative dataset paths work inside Docker.
+    # Read the original CSV, standardize columns, convert
+    # data types and generate data-quality flags.
     # --------------------------------------------------------
     transform_data = BashOperator(
         task_id="transform_data",
@@ -62,10 +65,7 @@ with DAG(
     # --------------------------------------------------------
     # TASK 2: SPLIT DATA INTO TABLES
     #
-    # Create three CSV files:
-    # - customers.csv
-    # - products.csv
-    # - orders.csv
+    # Generate customers.csv, products.csv and orders.csv.
     # --------------------------------------------------------
     split_into_tables = BashOperator(
         task_id="split_into_tables",
@@ -77,12 +77,10 @@ with DAG(
     )
 
     # --------------------------------------------------------
-    # TASK 3: UPLOAD FILES TO AMAZON S3
+    # TASK 3: UPLOAD TO AMAZON S3
     #
-    # Upload all three CSV files to the retail/ prefix
-    # in the project's S3 bucket.
-    #
-    # Boto3 uses the AWS credentials available to the worker.
+    # Upload the three CSV files to the retail/ S3 prefix.
+    # Credentials are supplied through the worker environment.
     # --------------------------------------------------------
     upload_to_s3 = BashOperator(
         task_id="upload_to_s3",
@@ -94,10 +92,9 @@ with DAG(
     )
 
     # --------------------------------------------------------
-    # TASK 4: VERIFY SNOWFLAKE CONNECTION
+    # TASK 4: VERIFY SNOWFLAKE
     #
-    # Execute a read-only SQL query to confirm that Airflow
-    # can connect to Snowflake using snowflake_default.
+    # Confirm that Airflow can execute SQL in Snowflake.
     # --------------------------------------------------------
     verify_snowflake = SQLExecuteQueryOperator(
         task_id="verify_snowflake",
@@ -114,10 +111,8 @@ with DAG(
     # --------------------------------------------------------
     # TASK 5: STAGE CUSTOMERS
     #
-    # Recreate a transient staging table matching CUSTOMERS.
-    # Load customers.csv from the external S3 stage.
-    #
-    # The final CUSTOMERS table remains unchanged.
+    # Recreate an empty staging table matching CUSTOMERS.
+    # Load customers.csv without changing the final table.
     # --------------------------------------------------------
     stage_customers = SQLExecuteQueryOperator(
         task_id="stage_customers",
@@ -147,10 +142,8 @@ with DAG(
     # --------------------------------------------------------
     # TASK 6: STAGE PRODUCTS
     #
-    # Recreate a transient staging table matching PRODUCTS.
-    # Load products.csv from the external S3 stage.
-    #
-    # The final PRODUCTS table remains unchanged.
+    # Recreate an empty staging table matching PRODUCTS.
+    # Load products.csv without changing the final table.
     # --------------------------------------------------------
     stage_products = SQLExecuteQueryOperator(
         task_id="stage_products",
@@ -180,10 +173,8 @@ with DAG(
     # --------------------------------------------------------
     # TASK 7: STAGE ORDERS
     #
-    # Recreate a transient staging table matching ORDERS.
-    # Load orders.csv from the external S3 stage.
-    #
-    # The final ORDERS table remains unchanged.
+    # Recreate an empty staging table matching ORDERS.
+    # Load orders.csv without changing the final table.
     # --------------------------------------------------------
     stage_orders = SQLExecuteQueryOperator(
         task_id="stage_orders",
@@ -213,15 +204,8 @@ with DAG(
     # --------------------------------------------------------
     # TASK 8: VALIDATE STAGING DATA
     #
-    # Check all three staging tables for:
-    # - Expected row counts
-    # - Unique primary identifiers
-    # - No missing primary identifiers
-    #
-    # SQLCheckOperator fails if any returned value is false.
-    #
-    # Expected counts are fixed for the current source CSV.
-    # We will make these checks dynamic for incremental loads.
+    # Verify expected row counts and unique, non-null keys.
+    # A failed check prevents the publishing task from running.
     # --------------------------------------------------------
     validate_staging = SQLCheckOperator(
         task_id="validate_staging",
@@ -255,12 +239,122 @@ with DAG(
     )
 
     # --------------------------------------------------------
+    # TASK 9: PUBLISH VALIDATED DATA
+    #
+    # Replace the rows in all three final tables.
+    #
+    # INSERT OVERWRITE preserves the existing table objects,
+    # schemas and grants.
+    #
+    # BEGIN/COMMIT group the three changes in one transaction.
+    # If an operation fails before COMMIT, the transaction
+    # should be rolled back rather than partially published.
+    # --------------------------------------------------------
+    publish_to_snowflake = SQLExecuteQueryOperator(
+        task_id="publish_to_snowflake",
+        conn_id="snowflake_default",
+        autocommit=False,
+        sql=[
+            """
+            BEGIN TRANSACTION
+            """,
+            """
+            INSERT OVERWRITE INTO RETAIL_ETL_DB.RETAIL.CUSTOMERS
+                (CUSTOMER_ID, PRIMARY_COUNTRY)
+            SELECT
+                CUSTOMER_ID,
+                PRIMARY_COUNTRY
+            FROM RETAIL_ETL_DB.RETAIL.CUSTOMERS_STAGING
+            """,
+            """
+            INSERT OVERWRITE INTO RETAIL_ETL_DB.RETAIL.PRODUCTS
+                (STOCK_CODE, DESCRIPTION)
+            SELECT
+                STOCK_CODE,
+                DESCRIPTION
+            FROM RETAIL_ETL_DB.RETAIL.PRODUCTS_STAGING
+            """,
+            """
+            INSERT OVERWRITE INTO RETAIL_ETL_DB.RETAIL.ORDERS
+                (
+                    ORDER_LINE_ID,
+                    INVOICE_NUMBER,
+                    STOCK_CODE,
+                    CUSTOMER_ID,
+                    INVOICE_DATE,
+                    QUANTITY,
+                    UNIT_PRICE,
+                    IS_CANCELLATION,
+                    IS_OTHER_NEGATIVE_ADJUSTMENT,
+                    IS_NONPOSITIVE_PRICE,
+                    IS_REGULAR_SALE,
+                    IS_MISSING_CUSTOMER
+                )
+            SELECT
+                ORDER_LINE_ID,
+                INVOICE_NUMBER,
+                STOCK_CODE,
+                CUSTOMER_ID,
+                INVOICE_DATE,
+                QUANTITY,
+                UNIT_PRICE,
+                IS_CANCELLATION,
+                IS_OTHER_NEGATIVE_ADJUSTMENT,
+                IS_NONPOSITIVE_PRICE,
+                IS_REGULAR_SALE,
+                IS_MISSING_CUSTOMER
+            FROM RETAIL_ETL_DB.RETAIL.ORDERS_STAGING
+            """,
+            """
+            COMMIT
+            """,
+        ],
+    )
+
+    # --------------------------------------------------------
+    # TASK 10: VALIDATE PUBLISHED DATA
+    #
+    # Verify that the final tables contain the expected
+    # rows with unique, non-null primary identifiers.
+    #
+    # This catches publishing errors after the transaction.
+    # --------------------------------------------------------
+    validate_published_data = SQLCheckOperator(
+        task_id="validate_published_data",
+        conn_id="snowflake_default",
+        sql="""
+            SELECT
+                (
+                    SELECT
+                        COUNT(*) = 4372
+                        AND COUNT(*) = COUNT(DISTINCT CUSTOMER_ID)
+                        AND COUNT(*) = COUNT(CUSTOMER_ID)
+                    FROM RETAIL_ETL_DB.RETAIL.CUSTOMERS
+                ) AS CUSTOMERS_VALID,
+
+                (
+                    SELECT
+                        COUNT(*) = 4070
+                        AND COUNT(*) = COUNT(DISTINCT STOCK_CODE)
+                        AND COUNT(*) = COUNT(STOCK_CODE)
+                    FROM RETAIL_ETL_DB.RETAIL.PRODUCTS
+                ) AS PRODUCTS_VALID,
+
+                (
+                    SELECT
+                        COUNT(*) = 541909
+                        AND COUNT(*) = COUNT(DISTINCT ORDER_LINE_ID)
+                        AND COUNT(*) = COUNT(ORDER_LINE_ID)
+                    FROM RETAIL_ETL_DB.RETAIL.ORDERS
+                ) AS ORDERS_VALID
+        """,
+    )
+
+    # --------------------------------------------------------
     # TASK DEPENDENCIES
     #
-    # Each task executes only after the previous task
-    # completes successfully.
-    #
-    # A failed validation stops the DAG before publishing.
+    # Tasks execute in order. Publishing happens only after
+    # all three staging tables pass validation.
     # --------------------------------------------------------
     (
         transform_data
@@ -271,4 +365,6 @@ with DAG(
         >> stage_products
         >> stage_orders
         >> validate_staging
+        >> publish_to_snowflake
+        >> validate_published_data
     )
