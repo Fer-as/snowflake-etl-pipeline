@@ -11,12 +11,14 @@ from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 # RETAIL ETL PIPELINE
 #
 # 1. Transform the original retail dataset
-# 2. Split the transformed data into three CSV files
-# 3. Upload the CSV files to Amazon S3
+# 2. Split the data into customers, products and orders
+# 3. Upload the three CSV files to Amazon S3
 # 4. Verify the Airflow-to-Snowflake connection
-# 5. Load customer data into a Snowflake staging table
+# 5. Load customers into a Snowflake staging table
+# 6. Load products into a Snowflake staging table
+# 7. Load orders into a Snowflake staging table
 #
-# The DAG runs manually while we develop and test it.
+# Runs manually during development and testing.
 # ============================================================
 
 with DAG(
@@ -36,10 +38,8 @@ with DAG(
     # --------------------------------------------------------
     # TASK 1: TRANSFORM DATA
     #
-    # Read the original CSV, clean column names and data
-    # types, and generate data-quality flags.
-    #
-    # cwd ensures relative file paths resolve correctly.
+    # Read the original retail CSV, standardize columns,
+    # convert data types, and generate data-quality flags.
     # --------------------------------------------------------
     transform_data = BashOperator(
         task_id="transform_data",
@@ -51,10 +51,10 @@ with DAG(
     )
 
     # --------------------------------------------------------
-    # TASK 2: SPLIT INTO TABLES
+    # TASK 2: SPLIT DATA INTO TABLES
     #
-    # Generate customers.csv, products.csv and orders.csv
-    # from the transformed dataset.
+    # Create three CSV files:
+    # customers.csv, products.csv and orders.csv.
     # --------------------------------------------------------
     split_into_tables = BashOperator(
         task_id="split_into_tables",
@@ -66,12 +66,10 @@ with DAG(
     )
 
     # --------------------------------------------------------
-    # TASK 3: UPLOAD TO S3
+    # TASK 3: UPLOAD FILES TO AMAZON S3
     #
-    # Upload the three CSV files to the retail/ prefix in
-    # the project's S3 bucket.
-    #
-    # Boto3 uses the AWS credentials available to the worker.
+    # Upload the three CSV files to the retail/ folder
+    # in the configured S3 bucket.
     # --------------------------------------------------------
     upload_to_s3 = BashOperator(
         task_id="upload_to_s3",
@@ -85,8 +83,8 @@ with DAG(
     # --------------------------------------------------------
     # TASK 4: VERIFY SNOWFLAKE CONNECTION
     #
-    # Execute a read-only SQL query to confirm that Airflow
-    # can connect to Snowflake using snowflake_default.
+    # Run a read-only SQL query to confirm that Airflow
+    # can connect using the snowflake_default connection.
     # --------------------------------------------------------
     verify_snowflake = SQLExecuteQueryOperator(
         task_id="verify_snowflake",
@@ -101,14 +99,11 @@ with DAG(
     )
 
     # --------------------------------------------------------
-    # TASK 5: STAGE CUSTOMER DATA
+    # TASK 5: STAGE CUSTOMERS
     #
-    # Create a fresh transient staging table with the same
-    # structure as the final CUSTOMERS table.
-    #
-    # Load customers.csv from the Snowflake external S3 stage.
-    #
-    # The existing CUSTOMERS table remains unchanged.
+    # Recreate a transient staging table matching CUSTOMERS.
+    # Load customers.csv from the external S3 stage.
+    # The final CUSTOMERS table is not modified.
     # --------------------------------------------------------
     stage_customers = SQLExecuteQueryOperator(
         task_id="stage_customers",
@@ -136,9 +131,73 @@ with DAG(
     )
 
     # --------------------------------------------------------
+    # TASK 6: STAGE PRODUCTS
+    #
+    # Recreate a transient staging table matching PRODUCTS.
+    # Load products.csv from the external S3 stage.
+    # The final PRODUCTS table is not modified.
+    # --------------------------------------------------------
+    stage_products = SQLExecuteQueryOperator(
+        task_id="stage_products",
+        conn_id="snowflake_default",
+        sql=[
+            """
+            CREATE OR REPLACE TRANSIENT TABLE
+                RETAIL_ETL_DB.RETAIL.PRODUCTS_STAGING
+            LIKE RETAIL_ETL_DB.RETAIL.PRODUCTS
+            """,
+            """
+            COPY INTO RETAIL_ETL_DB.RETAIL.PRODUCTS_STAGING
+            FROM @RETAIL_ETL_DB.RETAIL.RETAIL_S3_STAGE
+            FILES = ('products.csv')
+            FILE_FORMAT = (
+                TYPE = CSV
+                SKIP_HEADER = 1
+                FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+                NULL_IF = ('')
+                EMPTY_FIELD_AS_NULL = TRUE
+            )
+            ON_ERROR = 'ABORT_STATEMENT'
+            """,
+        ],
+    )
+
+    # --------------------------------------------------------
+    # TASK 7: STAGE ORDERS
+    #
+    # Recreate a transient staging table matching ORDERS.
+    # Load orders.csv from the external S3 stage.
+    # The final ORDERS table is not modified.
+    # --------------------------------------------------------
+    stage_orders = SQLExecuteQueryOperator(
+        task_id="stage_orders",
+        conn_id="snowflake_default",
+        sql=[
+            """
+            CREATE OR REPLACE TRANSIENT TABLE
+                RETAIL_ETL_DB.RETAIL.ORDERS_STAGING
+            LIKE RETAIL_ETL_DB.RETAIL.ORDERS
+            """,
+            """
+            COPY INTO RETAIL_ETL_DB.RETAIL.ORDERS_STAGING
+            FROM @RETAIL_ETL_DB.RETAIL.RETAIL_S3_STAGE
+            FILES = ('orders.csv')
+            FILE_FORMAT = (
+                TYPE = CSV
+                SKIP_HEADER = 1
+                FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+                NULL_IF = ('')
+                EMPTY_FIELD_AS_NULL = TRUE
+            )
+            ON_ERROR = 'ABORT_STATEMENT'
+            """,
+        ],
+    )
+
+    # --------------------------------------------------------
     # TASK DEPENDENCIES
     #
-    # Each task runs only after the previous one succeeds.
+    # Execute each task only after its predecessor succeeds.
     # --------------------------------------------------------
     (
         transform_data
@@ -146,4 +205,6 @@ with DAG(
         >> upload_to_s3
         >> verify_snowflake
         >> stage_customers
+        >> stage_products
+        >> stage_orders
     )
