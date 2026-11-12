@@ -243,6 +243,6 @@ crash.*.log
 assets/datasets/Transformed_full/*
 assets/datasets/Transformed_tables/*
 /assets/datasets/Original_file/*.csv
-
+/assets/datasets/Incremental_batches/
 !assets/datasets/Transformed_full/.gitkeep
 !assets/datasets/Transformed_tables/.gitkeep
