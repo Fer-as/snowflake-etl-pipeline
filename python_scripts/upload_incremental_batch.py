@@ -24,6 +24,7 @@ Without --batch-id, the script uses batch 001.
 """
 
 import argparse
+import os
 from hashlib import sha256
 from pathlib import Path
 
@@ -53,8 +54,8 @@ OUTPUT_DIRECTORY = (
     / "Incremental_batches"
 )
 
-BUCKET_NAME = "snowflake-retail-etl-670941257756"
-AWS_REGION = "eu-west-2"
+BUCKET_NAME = os.environ.get("RETAIL_S3_BUCKET", "snowflake-retail-etl-670941257756")
+AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "eu-west-2")
 S3_PREFIX = "retail/incremental"
 
 
