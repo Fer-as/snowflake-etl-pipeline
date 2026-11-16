@@ -1,0 +1,75 @@
+{
+  "description": "Dataset-level lineage for the Snowflake ETL pipeline. Loosely follows OpenLineage concepts (datasets with namespaces, jobs with inputs/outputs). Validated by tests/test_lineage.py. Human-readable version: docs/lineage.md.",
+  "version": 1,
+  "datasets": {
+    "raw_retail_csv": {"namespace": "file", "name": "assets/datasets/Original_file/data.csv", "rows": 541909, "encoding": "cp1252"},
+    "transformed_full_csv": {"namespace": "file", "name": "assets/datasets/Transformed_full/transformed_data.csv", "rows": 541909},
+    "customers_csv": {"namespace": "file", "name": "assets/datasets/Transformed_tables/customers.csv", "rows": 4372},
+    "products_csv": {"namespace": "file", "name": "assets/datasets/Transformed_tables/products.csv", "rows": 4070},
+    "orders_csv": {"namespace": "file", "name": "assets/datasets/Transformed_tables/orders.csv", "rows": 541909},
+    "s3_customers": {"namespace": "s3://${RETAIL_S3_BUCKET}", "name": "retail/customers.csv"},
+    "s3_products": {"namespace": "s3://${RETAIL_S3_BUCKET}", "name": "retail/products.csv"},
+    "s3_orders": {"namespace": "s3://${RETAIL_S3_BUCKET}", "name": "retail/orders.csv"},
+    "retail_s3_stage": {"namespace": "snowflake", "name": "RETAIL_ETL_DB.RETAIL.RETAIL_S3_STAGE", "terraform": "terraform/stage.tf"},
+    "customers_staging": {"namespace": "snowflake", "name": "RETAIL_ETL_DB.RETAIL.CUSTOMERS_STAGING", "kind": "transient"},
+    "products_staging": {"namespace": "snowflake", "name": "RETAIL_ETL_DB.RETAIL.PRODUCTS_STAGING", "kind": "transient"},
+    "orders_staging": {"namespace": "snowflake", "name": "RETAIL_ETL_DB.RETAIL.ORDERS_STAGING", "kind": "transient"},
+    "customers": {"namespace": "snowflake", "name": "RETAIL_ETL_DB.RETAIL.CUSTOMERS", "rows": 4372, "terraform": "terraform/tables.tf"},
+    "products": {"namespace": "snowflake", "name": "RETAIL_ETL_DB.RETAIL.PRODUCTS", "rows": 4070, "terraform": "terraform/tables.tf"},
+    "orders": {"namespace": "snowflake", "name": "RETAIL_ETL_DB.RETAIL.ORDERS", "rows": 541909, "terraform": "terraform/tables.tf"},
+    "local_incremental_batches": {"namespace": "file", "name": "assets/datasets/Incremental_batches/orders_batch_###.csv"},
+    "s3_incremental_batches": {"namespace": "s3://${RETAIL_S3_BUCKET}", "name": "retail/incremental/orders_batch_###.csv", "immutable": true},
+    "orders_incremental": {"namespace": "snowflake", "name": "RETAIL_ETL_DB.RETAIL.ORDERS_INCREMENTAL_S3_AIRFLOW", "kind": "transient", "key": ["SOURCE_FILE", "SOURCE_ROW_NUMBER"]},
+    "dashboard": {"namespace": "app", "name": "dashboard/app.py"}
+  },
+  "jobs": [
+    {"dag": "retail_etl_pipeline", "task": "transform_data", "code": "python_scripts/transform_data_script.py", "inputs": ["raw_retail_csv"], "outputs": ["transformed_full_csv"]},
+    {"dag": "retail_etl_pipeline", "task": "split_into_tables", "code": "python_scripts/split_data_into_tables.py", "inputs": ["transformed_full_csv"], "outputs": ["customers_csv", "products_csv", "orders_csv"]},
+    {"dag": "retail_etl_pipeline", "task": "upload_to_s3", "code": "python_scripts/upload_data_to_s3_bucket.py", "inputs": ["customers_csv", "products_csv", "orders_csv"], "outputs": ["s3_customers", "s3_products", "s3_orders"]},
+    {"dag": "retail_etl_pipeline", "task": "verify_snowflake", "code": "airflow/dags/retail_etl_dag.py", "inputs": [], "outputs": [], "check": true, "note": "connectivity gate: session database/schema/role/warehouse"},
+    {"dag": "retail_etl_pipeline", "task": "stage_customers", "code": "airflow/dags/retail_etl_dag.py", "inputs": ["s3_customers", "retail_s3_stage"], "outputs": ["customers_staging"]},
+    {"dag": "retail_etl_pipeline", "task": "stage_products", "code": "airflow/dags/retail_etl_dag.py", "inputs": ["s3_products", "retail_s3_stage"], "outputs": ["products_staging"]},
+    {"dag": "retail_etl_pipeline", "task": "stage_orders", "code": "airflow/dags/retail_etl_dag.py", "inputs": ["s3_orders", "retail_s3_stage"], "outputs": ["orders_staging"]},
+    {"dag": "retail_etl_pipeline", "task": "validate_staging", "code": "airflow/dags/retail_etl_dag.py", "inputs": ["customers_staging", "products_staging", "orders_staging"], "outputs": [], "check": true},
+    {"dag": "retail_etl_pipeline", "task": "publish_to_snowflake", "code": "airflow/dags/retail_etl_dag.py", "inputs": ["customers_staging", "products_staging", "orders_staging"], "outputs": ["customers", "products", "orders"]},
+    {"dag": "retail_etl_pipeline", "task": "validate_published_data", "code": "airflow/dags/retail_etl_dag.py", "inputs": ["customers", "products", "orders"], "outputs": [], "check": true},
+    {"dag": "retail_etl_pipeline", "task": "validate_final_consistency", "code": "airflow/dags/retail_etl_dag.py", "inputs": ["customers", "products", "orders", "customers_staging", "products_staging", "orders_staging"], "outputs": [], "check": true},
+    {"dag": "incremental_s3_orders", "task": "upload_batch_001", "code": "python_scripts/upload_incremental_batch.py", "inputs": ["orders_csv"], "outputs": ["local_incremental_batches", "s3_incremental_batches"]},
+    {"dag": "incremental_s3_orders", "task": "upload_batch_002", "code": "python_scripts/upload_incremental_batch.py", "inputs": ["orders_csv"], "outputs": ["local_incremental_batches", "s3_incremental_batches"]},
+    {"dag": "incremental_s3_orders", "task": "create_incremental_target", "code": "airflow/dags/incremental_s3_orders_dag.py", "inputs": [], "outputs": ["orders_incremental"]},
+    {"dag": "incremental_s3_orders", "task": "validate_s3_batches", "code": "airflow/dags/incremental_s3_orders_dag.py", "inputs": ["s3_incremental_batches", "retail_s3_stage"], "outputs": [], "check": true},
+    {"dag": "incremental_s3_orders", "task": "merge_incremental_orders", "code": "airflow/dags/incremental_s3_orders_dag.py", "inputs": ["s3_incremental_batches", "retail_s3_stage"], "outputs": ["orders_incremental"]},
+    {"dag": "incremental_s3_orders", "task": "validate_incremental_target", "code": "airflow/dags/incremental_s3_orders_dag.py", "inputs": ["orders_incremental", "s3_incremental_batches"], "outputs": [], "check": true},
+    {"dag": "incremental_s3_orders", "task": "replay_incremental_batches", "code": "airflow/dags/incremental_s3_orders_dag.py", "inputs": ["s3_incremental_batches", "retail_s3_stage"], "outputs": ["orders_incremental"]},
+    {"dag": "incremental_s3_orders", "task": "validate_idempotency", "code": "airflow/dags/incremental_s3_orders_dag.py", "inputs": ["orders_incremental", "s3_incremental_batches"], "outputs": [], "check": true},
+    {"dag": null, "task": "streamlit_dashboard", "code": "dashboard/app.py", "inputs": ["customers", "products", "orders"], "outputs": ["dashboard"]}
+  ],
+  "column_lineage": {
+    "orders": {
+      "ORDER_LINE_ID": {"from": [], "transform": "generated: row position 1..N (split_data_into_tables.py)"},
+      "INVOICE_NUMBER": {"from": ["raw_retail_csv.InvoiceNo"], "transform": "rename, string"},
+      "STOCK_CODE": {"from": ["raw_retail_csv.StockCode"], "transform": "rename, string"},
+      "CUSTOMER_ID": {"from": ["raw_retail_csv.CustomerID"], "transform": "float -> nullable integer"},
+      "INVOICE_DATE": {"from": ["raw_retail_csv.InvoiceDate"], "transform": "parse %m/%d/%Y %H:%M -> TIMESTAMP_NTZ"},
+      "QUANTITY": {"from": ["raw_retail_csv.Quantity"], "transform": "rename"},
+      "UNIT_PRICE": {"from": ["raw_retail_csv.UnitPrice"], "transform": "rename -> NUMBER(18,4)"},
+      "IS_CANCELLATION": {"from": ["raw_retail_csv.InvoiceNo"], "transform": "invoice_number starts with 'C'"},
+      "IS_OTHER_NEGATIVE_ADJUSTMENT": {"from": ["raw_retail_csv.Quantity", "raw_retail_csv.InvoiceNo"], "transform": "quantity < 0 AND NOT is_cancellation"},
+      "IS_NONPOSITIVE_PRICE": {"from": ["raw_retail_csv.UnitPrice"], "transform": "unit_price <= 0"},
+      "IS_REGULAR_SALE": {"from": ["raw_retail_csv.Quantity", "raw_retail_csv.UnitPrice", "raw_retail_csv.InvoiceNo"], "transform": "quantity > 0 AND unit_price > 0 AND NOT is_cancellation"},
+      "IS_MISSING_CUSTOMER": {"from": ["raw_retail_csv.CustomerID"], "transform": "customer_id IS NULL"}
+    },
+    "customers": {
+      "CUSTOMER_ID": {"from": ["raw_retail_csv.CustomerID"], "transform": "distinct non-null"},
+      "PRIMARY_COUNTRY": {"from": ["raw_retail_csv.Country"], "transform": "mode per customer"}
+    },
+    "products": {
+      "STOCK_CODE": {"from": ["raw_retail_csv.StockCode"], "transform": "distinct"},
+      "DESCRIPTION": {"from": ["raw_retail_csv.Description"], "transform": "mode per stock code"}
+    },
+    "orders_incremental": {
+      "SOURCE_FILE": {"from": ["s3_incremental_batches.METADATA$FILENAME"], "transform": "Snowflake file metadata"},
+      "SOURCE_ROW_NUMBER": {"from": ["s3_incremental_batches.METADATA$FILE_ROW_NUMBER"], "transform": "Snowflake file metadata"}
+    }
+  }
+}
