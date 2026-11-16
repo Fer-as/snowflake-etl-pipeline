@@ -1,0 +1,7 @@
+# Local development and tests (Python 3.12+).
+# The Airflow runtime dependencies come from the Docker image instead.
+-r dashboard/requirements.txt
+boto3>=1.35,<2
+pytest>=8,<10
+# Optional: dashboard screenshots
+# playwright>=1.48

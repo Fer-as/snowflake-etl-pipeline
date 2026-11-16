@@ -6,8 +6,8 @@ install and run inside the project's Airflow image:
 
     make test-dags
     # or
-    docker compose run --rm --no-deps --entrypoint bash airflow-worker \
-        -c "pip install -q pytest && python -m pytest tests/test_dag_integrity.py -v"
+    docker run --rm --entrypoint bash -v "$PWD:/project:ro" -w /project \
+        retail-etl-airflow:3.3.0 -c "pip install -q pytest && python -m pytest tests/ -v"
 
 They protect the verified behaviour of the existing pipelines:
     - every DAG file imports without errors
