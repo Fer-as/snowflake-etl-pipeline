@@ -1,3 +1,14 @@
+"""
+Full-refresh retail ETL pipeline (11 tasks).
+
+Raw CSV -> pandas transform -> split into 3 tables -> S3 ->
+Snowflake external stage -> staging tables -> validated final tables.
+
+Failure alerting:
+    Every task uses ``send_sns_failure_alert`` as its
+    ``on_failure_callback``. Airflow calls it only after the final retry
+    fails, so each failed task sends exactly one SNS email.
+"""
 
 from datetime import timedelta
 
@@ -9,6 +20,9 @@ from airflow.providers.common.sql.operators.sql import (
     SQLExecuteQueryOperator,
     SQLCheckOperator,
 )
+
+# Loaded from airflow/plugins (on Airflow's Python path).
+from etl_sns_alerts import send_sns_failure_alert
 
 
 # ============================================================
@@ -41,8 +55,11 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     default_args={
+        # One retry absorbs transient network/warehouse errors.
         "retries": 1,
         "retry_delay": timedelta(minutes=2),
+        # Fires once, after the final attempt fails (not on retry).
+        "on_failure_callback": send_sns_failure_alert,
     },
     tags=["retail", "etl", "snowflake"],
 ) as dag:
