@@ -336,7 +336,7 @@ customer and country views. Details and auth options are in
 
 ```powershell
 pip install -r requirements-dev.txt
-python -m pytest            # 56 local tests (DAG tests skip without Airflow)
+python -m pytest            # 58 local tests (DAG tests skip without Airflow)
 make test-dags              # full suite inside the Airflow 3.3.0 image
 make tf-check               # terraform fmt -check + validate
 docker compose config -q    # compose syntax
@@ -351,27 +351,53 @@ docker compose config -q    # compose syntax
 | Lineage manifest matches code and schema | `tests/test_lineage.py` | ✅ automated |
 | Dashboard SQL safety, credentials handling, reconciliation, headless render | `tests/test_dashboard.py` | ✅ automated |
 | Terraform | `fmt -check`, `validate` | ✅ (no plan/apply) |
-| Full-refresh and incremental DAG runs against AWS + Snowflake | Airflow UI | ✅ verified in earlier runs; re-run after this change (see below) |
-| SNS email from a failing task | Temporary failing DAG (since removed) | ✅ verified earlier; `make alert-test` re-checks the new callback |
+| Connections (AWS identity, S3 objects, SNS topic, Snowflake) | `connection_healthcheck` DAG | ✅ all 4 checks passed on the final code |
+| Full-refresh DAG against AWS + Snowflake | `retail_etl_pipeline` run, all 11 tasks | ✅ success; ORDERS 541,909 / CUSTOMERS 4,372 / PRODUCTS 4,070, keys unique |
+| Incremental DAG is idempotent | `incremental_s3_orders` run twice more | ✅ target still 8 rows, 8 unique source identities (4 per batch) |
+| SNS alert through the production callback | `make alert-test` | ✅ accepted by SNS and delivered by email |
+| Dashboard against live Snowflake | Browser check of every tab | ✅ revenue £10,666,684.54, identical to offline mode |
 
-**Manual cloud verification after pulling these changes:** `aws login`, then
-`docker compose up -d`. Next, `make healthcheck`, `make alert-test`, and
-trigger `incremental_s3_orders`, which is idempotent and leaves the target
-unchanged. Optionally re-run `retail_etl_pipeline` (a full refresh rewrites
-the final tables with identical data). Finally, run the dashboard in
-Snowflake mode and confirm revenue **£10,666,684.54** (hover the KPI).
+**Re-running the cloud checks:** `aws login`, then `docker compose up -d`,
+`make healthcheck`, `make alert-test`, and trigger `incremental_s3_orders`
+(idempotent: it leaves the target unchanged). Re-running `retail_etl_pipeline`
+is also safe: the final tables are overwritten in one transaction only after
+the staging tables pass the count and uniqueness gates. Finally, run the
+dashboard in Snowflake mode and confirm revenue **£10,666,684.54** (hover the
+KPI).
 
 ## Screenshots
 
+All screenshots come from real runs against AWS and Snowflake. They show no
+account identifiers or credentials.
+
+**Airflow:** the four DAGs, then the full-refresh (11 tasks) and incremental
+(8 tasks) runs.
+
+![Airflow DAG list](docs/screenshots/airflow_dags_list.png)
+
+![Full-refresh graph](docs/screenshots/airflow_full_refresh_graph_crop.png)
+
+![Incremental graph](docs/screenshots/airflow_incremental_graph_crop.png)
+
+| Full-refresh run | Connection health check |
+|---|---|
+| ![Full-refresh run](docs/screenshots/airflow_full_refresh_run.png) | ![Health check](docs/screenshots/airflow_healthcheck_run.png) |
+| **Published-data validation (counts 4,372 / 4,070 / 541,909)** | **Incremental idempotency validation** |
+| ![Validation log](docs/screenshots/airflow_full_refresh_validation_log.png) | ![Idempotency log](docs/screenshots/airflow_incremental_idempotency_log.png) |
+
+**Dashboard:** live Snowflake mode. The caption under the title names the source.
+
 | Revenue trend | Top products |
 |---|---|
-| ![Revenue trend](docs/screenshots/dashboard_1_revenue_trend.png) | ![Top products](docs/screenshots/dashboard_2_top_products.png) |
+| ![Revenue trend](docs/screenshots/dashboard_live_1_revenue_trend.png) | ![Top products](docs/screenshots/dashboard_live_2_top_products.png) |
 | **Countries** | **Data quality** |
-| ![Countries](docs/screenshots/dashboard_3_countries.png) | ![Data quality](docs/screenshots/dashboard_5_data_quality.png) |
+| ![Countries](docs/screenshots/dashboard_live_3_countries.png) | ![Data quality](docs/screenshots/dashboard_live_5_data_quality.png) |
 
-These were captured in offline mode; the caption under each title names the
-source. Airflow, SNS and Snowsight screenshots need live services, and a
-capture checklist is in [docs/screenshots/README.md](docs/screenshots/README.md).
+The full list, including the offline-mode captures and the screenshots that
+need a personal login (the SNS email and Snowsight), is in
+[docs/screenshots/README.md](docs/screenshots/README.md). The lineage diagrams
+are Mermaid and render directly on GitHub in
+[docs/lineage.md](docs/lineage.md).
 
 ## Known limitations
 

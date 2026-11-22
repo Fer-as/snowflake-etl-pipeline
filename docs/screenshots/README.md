@@ -1,34 +1,44 @@
 # Screenshots
 
-## Included
+Every image here was captured from a real run. None show account
+identifiers, ARNs, email addresses or tokens.
 
-| File | Shows | Captured how |
-|---|---|---|
-| `dashboard_1_revenue_trend.png` | KPI row and monthly revenue | `dashboard/capture_screenshots.py`, **offline (local CSV) mode** |
-| `dashboard_2_top_products.png` | Top 10 products (gross) | same |
-| `dashboard_3_countries.png` | Revenue by country (UK hidden) | same |
-| `dashboard_4_customers.png` | Customer statistics | same |
-| `dashboard_5_data_quality.png` | Quality flags and revenue definitions | same |
+## Airflow (live AWS + Snowflake runs, 22 Nov 2026)
 
-Offline mode computes the same metrics as the Snowflake queries; the
-caption under the title in each image names the data source.
-
-## Still to capture (needs live services)
-
-These require a running Airflow stack with valid AWS and Snowflake sessions,
-so they cannot be generated from the repository alone. Save them in this
-folder with the suggested names, then link them from the main README.
-
-| Suggested file | How to capture |
+| File | Shows |
 |---|---|
-| `airflow_dags_list.png` | Airflow UI → *Dags*: `retail_etl_pipeline`, `incremental_s3_orders`, `connection_healthcheck` |
-| `airflow_full_refresh_graph.png` | `retail_etl_pipeline` → a successful run → *Graph* (11 green tasks) |
-| `airflow_incremental_graph.png` | `incremental_s3_orders` → a successful run → *Graph* (8 green tasks) |
-| `airflow_healthcheck_run.png` | `connection_healthcheck` successful run |
-| `sns_alert_email.png` | The email from `make alert-test`. **Crop or blur your email address** |
-| `snowflake_tables.png` | Snowsight → `RETAIL_ETL_DB.RETAIL`, with row counts for CUSTOMERS / PRODUCTS / ORDERS |
-| `snowflake_incremental_lineage.png` | Output of the trace query in `docs/lineage.md` §9 |
-| `dashboard_live_snowflake.png` | Dashboard with *Snowflake (live)* selected: `python dashboard/capture_screenshots.py` |
+| `airflow_dags_list.png` | The four DAGs, each with a successful latest run |
+| `airflow_full_refresh_run.png` | `retail_etl_pipeline` run: all 11 task instances succeeded |
+| `airflow_full_refresh_graph.png` / `_crop.png` | The same run in Graph view (11 green tasks) |
+| `airflow_full_refresh_validation_log.png` | `validate_published_data` log: count and uniqueness checks for 4,372 / 4,070 / 541,909 all `True` |
+| `airflow_incremental_graph.png` / `_crop.png` | `incremental_s3_orders` run in Graph view (8 green tasks) |
+| `airflow_incremental_idempotency_log.png` | `validate_idempotency` log after a replay: all checks `True` |
+| `airflow_healthcheck_run.png` | `connection_healthcheck`: AWS identity, S3 objects, SNS topic and Snowflake checks passed |
 
-Before committing any screenshot, check that it shows no account
-identifiers, ARNs, email addresses, tokens or browser bookmarks.
+Captured with Playwright against the local Airflow UI (1600×1000 viewport,
+2× scale).
+
+## Dashboard
+
+| File | Source |
+|---|---|
+| `dashboard_live_1_revenue_trend.png` … `dashboard_live_5_data_quality.png` | **Live Snowflake** (`RETAIL_ETL_DB.RETAIL`) |
+| `dashboard_1_revenue_trend.png` … `dashboard_5_data_quality.png` | Offline (local CSV) mode |
+
+The two sets show identical figures (revenue £10,666,684.54). The caption under
+the title in each image names the data source. To regenerate them:
+
+```powershell
+python dashboard/capture_screenshots.py                                  # offline app on :8501
+python dashboard/capture_screenshots.py --url http://localhost:8502 --prefix dashboard_live
+```
+
+## Not included (need a personal login)
+
+| Item | Why it isn't here | Equivalent evidence |
+|---|---|---|
+| SNS alert email | Shows a personal inbox and address | `make alert-test` returns the SNS MessageId; delivery was confirmed by the recipient |
+| Snowsight table views | Needs an interactive Snowflake login | The validation-log screenshots above show the same row-count and uniqueness checks |
+
+If you add either one, crop or blur the email address and account
+locator first.
