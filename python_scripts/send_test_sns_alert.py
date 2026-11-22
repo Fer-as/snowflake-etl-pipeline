@@ -20,10 +20,16 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-# The callback lives in airflow/plugins, which Airflow adds to sys.path.
-# Add it explicitly so this script also works as a plain Python process.
-PLUGINS_DIR = Path(__file__).resolve().parents[1] / "airflow" / "plugins"
-sys.path.insert(0, str(PLUGINS_DIR))
+# The callback lives in the Airflow plugins folder, which Airflow adds to
+# sys.path for tasks but not for a plain Python process. Its location differs
+# between a repository checkout (<repo>/airflow/plugins) and the containers
+# (/opt/airflow/plugins, next to /opt/airflow/python_scripts).
+BASE_DIR = Path(__file__).resolve().parents[1]
+PLUGINS_DIRS = (BASE_DIR / "airflow" / "plugins", BASE_DIR / "plugins")
+for plugins_dir in PLUGINS_DIRS:
+    if (plugins_dir / "etl_sns_alerts.py").is_file():
+        sys.path.insert(0, str(plugins_dir))
+        break
 
 from etl_sns_alerts import send_sns_failure_alert  # noqa: E402
 
