@@ -7,208 +7,396 @@
 #   - Redis: queues tasks for Celery workers
 #   - Airflow API server: provides the web interface
 #   - Airflow scheduler: schedules DAG runs
-#   - Airflow DAG processor: discovers and parses DAG files
+#   - Airflow DAG processor: discovers DAGs and runs callbacks
 #   - Airflow worker: executes ETL tasks
 #   - Airflow triggerer: handles deferred tasks
 #   - Airflow init: prepares the metadata database
+#
+# Monitoring:
+#   - Amazon SNS sends Airflow task failure notifications
+#   - AWS credentials come from the local AWS login session
+#
+# Security:
+#   - No AWS access keys are hardcoded
+#   - Sensitive Airflow settings come from .env
+#   - Local AWS mounts are for trusted development only
 # ============================================================
 
 
-# Shared configuration for all Airflow services.
-# The YAML anchor (&airflow-common) avoids repeating settings.
+# ============================================================
+# SHARED AIRFLOW CONFIGURATION
+# ============================================================
+
 x-airflow-common: &airflow-common
 
-  # Build our custom Airflow image.
-  # The Dockerfile installs boto3 and AWS CRT for AWS login.
+  # Build the custom Airflow image.
+  # The Dockerfile installs boto3 with AWS CRT support.
   build:
     context: ./docker
 
   image: retail-etl-airflow:3.3.0
 
   environment:
-    # Use CeleryExecutor to execute tasks in worker containers.
+
+    # --------------------------------------------------------
+    # AIRFLOW EXECUTOR
+    # --------------------------------------------------------
+
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
 
-    # PostgreSQL stores DAG runs, task states and metadata.
+    # --------------------------------------------------------
+    # AIRFLOW METADATA DATABASE
+    # --------------------------------------------------------
+
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
 
-    # Celery stores task results in PostgreSQL.
+    # --------------------------------------------------------
+    # CELERY CONFIGURATION
+    # --------------------------------------------------------
+
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
 
-    # Encryption key and API authentication settings.
-    # Values come from the local .env file.
-    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
-    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
-    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
-
-    # New DAGs start paused, so we can test them manually.
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
-    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-
-    # Redis acts as the message broker for CeleryExecutor.
     AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
 
-    # Workers communicate with the Airflow execution API.
+    # --------------------------------------------------------
+    # AIRFLOW SECURITY
+    # --------------------------------------------------------
+
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+
+    # --------------------------------------------------------
+    # AIRFLOW DAG SETTINGS
+    # --------------------------------------------------------
+
+    # New DAGs start paused for safe manual testing.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+
+    # Disable Airflow's example DAGs.
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    # --------------------------------------------------------
+    # AIRFLOW EXECUTION API
+    # --------------------------------------------------------
+
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-api-server:8080/execution/"
 
-  # Shared folders available inside Airflow containers.
-  # Our Python scripts use paths relative to /opt/airflow.
+    # --------------------------------------------------------
+    # AWS SNS MONITORING AND ALERTING
+    # --------------------------------------------------------
+
+    # Topic ARN comes from the local .env file.
+    # No email address or credentials are hardcoded.
+    AWS_SNS_TOPIC_ARN: ${AWS_SNS_TOPIC_ARN:-}
+
+    # Same AWS region as the retail S3 bucket and SNS topic.
+    AWS_DEFAULT_REGION: eu-west-2
+
+    # Link shown in alert emails.
+    AIRFLOW_UI_URL: ${AIRFLOW_UI_URL:-http://localhost:8080}
+
+    # --------------------------------------------------------
+    # AIRFLOW AWS CONNECTION (aws_default)
+    #
+    # Defined as an environment-variable connection so it is
+    # version-controlled and reproducible.
+    #
+    # It deliberately contains NO access keys. The Amazon
+    # provider then falls back to boto3's default credential
+    # chain, i.e. the temporary AWS login session mounted
+    # below. No static IAM user keys are ever created.
+    #
+    # Env-var connections are not listed in the UI's
+    # Admin > Connections page; verify them with:
+    #   airflow connections get aws_default
+    # or by running the connection_healthcheck DAG.
+    # --------------------------------------------------------
+
+    AIRFLOW_CONN_AWS_DEFAULT: '{"conn_type": "aws", "extra": {"region_name": "eu-west-2"}}'
+
+    AWS_ALERTS_CONN_ID: aws_default
+
+    # S3 bucket used by the upload scripts and health check.
+    RETAIL_S3_BUCKET: ${RETAIL_S3_BUCKET:-snowflake-retail-etl-670941257756}
+
+  # ----------------------------------------------------------
+  # SHARED AIRFLOW VOLUMES
+  # ----------------------------------------------------------
+
   volumes:
+
+    # Airflow DAG definitions.
     - ./airflow/dags:/opt/airflow/dags
+
+    # Shared Airflow plugins and SNS callback script.
     - ./airflow/plugins:/opt/airflow/plugins
+
+    # Airflow task logs.
     - ./airflow/logs:/opt/airflow/logs
+
+    # Python ETL scripts.
     - ./python_scripts:/opt/airflow/python_scripts
+
+    # Original and transformed datasets.
     - ./assets/datasets:/opt/airflow/assets/datasets
 
-  # Airflow services must wait for PostgreSQL and Redis.
+  # ----------------------------------------------------------
+  # SHARED SERVICE DEPENDENCIES
+  # ----------------------------------------------------------
+
   depends_on: &airflow-common-depends-on
+
     postgres:
       condition: service_healthy
+
     redis:
       condition: service_healthy
 
 
 # ============================================================
-# SERVICES
+# DOCKER COMPOSE SERVICES
 # ============================================================
 
 services:
 
-  # ----------------------------------------------------------
-  # PostgreSQL - Airflow metadata database
-  # ----------------------------------------------------------
+  # ==========================================================
+  # POSTGRESQL
+  #
+  # Stores Airflow metadata:
+  #   - DAG runs
+  #   - Task instances
+  #   - Airflow connections
+  #   - Scheduler metadata
+  # ==========================================================
+
   postgres:
+
     image: postgres:16
 
     volumes:
-      # Named volume keeps database data between restarts.
       - postgres_data:/var/lib/postgresql/data
 
     environment:
+
       POSTGRES_USER: ${POSTGRES_USER}
+
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
       POSTGRES_DB: ${POSTGRES_DB}
 
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
+
+      test:
+        - CMD
+        - pg_isready
+        - -U
+        - ${POSTGRES_USER}
+        - -d
+        - ${POSTGRES_DB}
+
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # ----------------------------------------------------------
-  # Redis - Message broker for CeleryExecutor
-  # ----------------------------------------------------------
+
+  # ==========================================================
+  # REDIS
+  #
+  # Message broker for CeleryExecutor.
+  # ==========================================================
+
   redis:
+
     image: redis:7-alpine
 
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+
+      test:
+        - CMD
+        - redis-cli
+        - ping
+
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # ----------------------------------------------------------
-  # Airflow initialization
-  # Runs database migrations before other Airflow services.
-  # Exits successfully when initialization is complete.
-  # ----------------------------------------------------------
+
+  # ==========================================================
+  # AIRFLOW INITIALIZATION
+  #
+  # Applies Airflow database migrations.
+  # ==========================================================
+
   airflow-init:
+
     <<: *airflow-common
+
     command: db migrate
+
     restart: "no"
 
-  # ----------------------------------------------------------
-  # DAG processor
-  # Discovers and parses airflow/dags/retail_etl_dag.py.
-  # ----------------------------------------------------------
+
+  # ==========================================================
+  # AIRFLOW DAG PROCESSOR
+  #
+  # Discovers and parses Airflow DAGs.
+  #
+  # IMPORTANT FOR MONITORING:
+  # Airflow 3 uses the DAG processor to execute callbacks.
+  #
+  # Therefore this service needs AWS credentials to publish
+  # failure notifications to Amazon SNS.
+  # ==========================================================
+
   airflow-dag-processor:
+
     <<: *airflow-common
+
     command: dag-processor
 
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
-
-  # ----------------------------------------------------------
-  # Scheduler
-  # Determines when DAG tasks should run.
-  # ----------------------------------------------------------
-  airflow-scheduler:
-    <<: *airflow-common
-    command: scheduler
-
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
-
-  # ----------------------------------------------------------
-  # API server
-  # Makes the Airflow UI available at localhost:8080.
-  # ----------------------------------------------------------
-  airflow-api-server:
-    <<: *airflow-common
-    command: api-server
-
-    ports:
-      - "8080:8080"
-
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
-
-  # ----------------------------------------------------------
-  # Worker
-  # Executes the Python transformation and S3 upload tasks.
-  # ----------------------------------------------------------
-  airflow-worker:
-    <<: *airflow-common
-    command: celery worker
-
-    # Service-specific volumes override the shared list.
-    # Therefore we repeat all five ETL mounts here.
+    # Override the shared volumes to add AWS access.
     volumes:
+
+      # Existing project volumes.
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/plugins:/opt/airflow/plugins
       - ./airflow/logs:/opt/airflow/logs
       - ./python_scripts:/opt/airflow/python_scripts
       - ./assets/datasets:/opt/airflow/assets/datasets
 
-      # Mount the existing Windows AWS CLI configuration.
-      # Read-only prevents the container changing the config.
-      - "${USERPROFILE}/.aws/config:/home/airflow/.aws/config:ro"
+      # AWS CLI configuration from the Windows host.
+      # Mounted read-only.
+      - "${AWS_CONFIG_DIR:-${USERPROFILE}/.aws}/config:/home/airflow/.aws/config:ro"
 
-      # Mount the local AWS login session cache.
-      # Boto3 and AWS CRT use it for temporary credentials.
-      # The cache is writable for session refresh.
-      # This mount is for trusted local development only.
-      - "${USERPROFILE}/.aws/login/cache:/home/airflow/.aws/login/cache"
+      # Temporary AWS login session cache.
+      # Used by boto3 and AWS CRT.
+      # Writable so session refresh can work.
+      - "${AWS_CONFIG_DIR:-${USERPROFILE}/.aws}/login/cache:/home/airflow/.aws/login/cache"
 
     depends_on:
+
       <<: *airflow-common-depends-on
+
       airflow-init:
         condition: service_completed_successfully
 
-  # ----------------------------------------------------------
-  # Triggerer
-  # Manages asynchronous and deferred Airflow tasks.
-  # ----------------------------------------------------------
-  airflow-triggerer:
+
+  # ==========================================================
+  # AIRFLOW SCHEDULER
+  #
+  # Schedules DAG runs and tasks.
+  # ==========================================================
+
+  airflow-scheduler:
+
     <<: *airflow-common
+
+    command: scheduler
+
+    depends_on:
+
+      <<: *airflow-common-depends-on
+
+      airflow-init:
+        condition: service_completed_successfully
+
+
+  # ==========================================================
+  # AIRFLOW API SERVER
+  #
+  # Provides the Airflow web interface:
+  # http://localhost:8080
+  # ==========================================================
+
+  airflow-api-server:
+
+    <<: *airflow-common
+
+    command: api-server
+
+    ports:
+      - "8080:8080"
+
+    depends_on:
+
+      <<: *airflow-common-depends-on
+
+      airflow-init:
+        condition: service_completed_successfully
+
+
+  # ==========================================================
+  # AIRFLOW WORKER
+  #
+  # Executes ETL tasks including:
+  #   - Python transformations
+  #   - CSV splitting
+  #   - S3 uploads
+  #   - Snowflake operations
+  #   - Incremental batch processing
+  #
+  # AWS access is already configured for this service.
+  # ==========================================================
+
+  airflow-worker:
+
+    <<: *airflow-common
+
+    command: celery worker
+
+    # Service-specific volumes replace shared volumes.
+    # Repeat all five project mounts.
+    volumes:
+
+      # Existing project volumes.
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/logs:/opt/airflow/logs
+      - ./python_scripts:/opt/airflow/python_scripts
+      - ./assets/datasets:/opt/airflow/assets/datasets
+
+      # AWS CLI configuration.
+      - "${AWS_CONFIG_DIR:-${USERPROFILE}/.aws}/config:/home/airflow/.aws/config:ro"
+
+      # AWS login session cache.
+      - "${AWS_CONFIG_DIR:-${USERPROFILE}/.aws}/login/cache:/home/airflow/.aws/login/cache"
+
+    depends_on:
+
+      <<: *airflow-common-depends-on
+
+      airflow-init:
+        condition: service_completed_successfully
+
+
+  # ==========================================================
+  # AIRFLOW TRIGGERER
+  #
+  # Handles deferred and asynchronous Airflow tasks.
+  # ==========================================================
+
+  airflow-triggerer:
+
+    <<: *airflow-common
+
     command: triggerer
 
     depends_on:
+
       <<: *airflow-common-depends-on
+
       airflow-init:
         condition: service_completed_successfully
 
 
 # ============================================================
-# PERSISTENT STORAGE
+# PERSISTENT DOCKER VOLUMES
 # ============================================================
 
 volumes:
-  # Preserve Airflow's PostgreSQL metadata between restarts.
+
+  # Preserve Airflow metadata between container restarts.
   postgres_data:

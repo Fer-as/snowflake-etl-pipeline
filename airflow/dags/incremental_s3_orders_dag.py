@@ -24,6 +24,9 @@ Safety:
     - Never modifies the main ORDERS table.
     - Never modifies the full-refresh DAG.
     - Supports repeated DAG executions.
+
+Alerting:
+    Failed tasks publish one SNS email after their final retry.
 """
 
 from datetime import timedelta
@@ -36,6 +39,9 @@ from airflow.providers.common.sql.operators.sql import (
     SQLCheckOperator,
     SQLExecuteQueryOperator,
 )
+
+# Loaded from airflow/plugins (on Airflow's Python path).
+from etl_sns_alerts import send_sns_failure_alert
 
 
 # ============================================================
@@ -303,6 +309,8 @@ with DAG(
     default_args={
         "retries": 1,
         "retry_delay": timedelta(minutes=2),
+        # SNS email after the final failed attempt (see plugins).
+        "on_failure_callback": send_sns_failure_alert,
     },
     tags=[
         "retail",
