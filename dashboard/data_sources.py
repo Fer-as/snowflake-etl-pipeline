@@ -181,6 +181,10 @@ class SnowflakeSource:
         self.settings = settings
         self._connection = connection
 
+    def describe(self) -> str:
+        """Secret-free summary shown in the dashboard caption."""
+        return self.settings.describe()
+
     def _connect(self):
         if self._connection is None:
             try:

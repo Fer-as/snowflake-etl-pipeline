@@ -141,6 +141,22 @@ class FakeConnection:
         return FakeCursor(self.log)
 
 
+def test_backends_expose_the_same_interface():
+    """The app calls these on whichever backend is active (regression: describe())."""
+    required = {"label", "describe", *ds.QUERY_NAMES}
+    for backend in (ds.SnowflakeSource, ds.LocalCsvSource):
+        assert required <= set(dir(backend)), backend.__name__
+
+
+def test_snowflake_source_describe_has_no_secret():
+    settings = ds.SnowflakeSettings.from_env(
+        {"SNOWFLAKE_ACCOUNT": "a", "SNOWFLAKE_USER": "u", "SNOWFLAKE_PASSWORD": "pw-secret"}
+    )
+    text = ds.SnowflakeSource(settings, connection=FakeConnection()).describe()
+    assert text == "RETAIL_ETL_DB.RETAIL on RETAIL_ETL_WH (password auth)"
+    assert "pw-secret" not in text
+
+
 def test_snowflake_source_binds_parameters_and_converts_decimals():
     connection = FakeConnection()
     settings = ds.SnowflakeSettings.from_env({"SNOWFLAKE_ACCOUNT": "a", "SNOWFLAKE_USER": "u", "SNOWFLAKE_TOKEN": "t"})
